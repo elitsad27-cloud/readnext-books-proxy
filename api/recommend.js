@@ -2,7 +2,6 @@ export default async function handler(req, res) {
   try {
     const googleKey = process.env.GOOGLE_BOOKS_KEY;
 
-    // If the key isn't available in Vercel, fail loudly (otherwise you just get empty results forever)
     if (!googleKey) {
       return res.status(500).json({
         error: "Missing GOOGLE_BOOKS_KEY environment variable in Vercel",
@@ -10,31 +9,27 @@ export default async function handler(req, res) {
       });
     }
 
-    // Read inputs
-    const q = (req.query.q || "").toString().trim(); // e.g. "Gone Girl"
-    const genre = (req.query.genre || "").toString().trim(); // e.g. "thriller"
-    const mood = (req.query.mood || "").toString().trim(); // e.g. "twisty"
+    // Inputs
+    const seed = (req.query.q || "").toString().trim();       // e.g. "Gone Girl"
+    const genre = (req.query.genre || "").toString().trim();  // e.g. "thriller"
+    const mood = (req.query.mood || "").toString().trim();    // e.g. "twisty" (DO NOT use in Google search)
 
-    // Build a set of search terms (simple expansion)
+    // --- Build search terms (ONLY seed + genre) ---
+    // Use intitle: for better precision when user enters a book title
     const terms = [];
-    if (q) terms.push(q);
+    if (seed) terms.push(`intitle:"${seed}"`);
     if (genre) terms.push(genre);
-    if (mood) terms.push(mood);
-    if (genre && mood) terms.push(`${genre} ${mood}`);
-    if (genre && q) terms.push(`${genre} ${q}`);
-    if (mood && q) terms.push(`${mood} ${q}`);
-    if (genre && mood && q) terms.push(`${genre} ${mood} ${q}`);
 
-    // Helpful “broad” queries
-    if (genre) terms.push(`${genre} best books`);
+    // Combine seed+genre to steer results
+    if (seed && genre) terms.push(`${genre} intitle:"${seed}"`);
+
+    // Add broad discovery queries per genre
+    if (genre) terms.push(`${genre} bestseller`);
     if (genre) terms.push(`${genre} new releases`);
 
-    // Remove duplicates + empty
     const uniqueTerms = Array.from(new Set(terms)).filter(Boolean);
 
-    // Fetch helper
     async function fetchBooks(term) {
-      // Note: using projection=full so you actually get description more often
       const params = new URLSearchParams({
         q: term,
         maxResults: "20",
@@ -46,15 +41,15 @@ export default async function handler(req, res) {
       });
 
       const url = `https://www.googleapis.com/books/v1/volumes?${params.toString()}`;
-
       const resp = await fetch(url);
 
-      // If Google returns an error, return it clearly
       if (!resp.ok) {
         let bodyText = "";
-        try {
+        try_toggle: try {
           bodyText = await resp.text();
-        } catch (e) {}
+        } catch (e) {
+          break try_toggle;
+        }
 
         return {
           ok: false,
@@ -77,7 +72,7 @@ export default async function handler(req, res) {
       };
     }
 
-    // Run searches (sequential to reduce rate-limit pain)
+    // Run searches (sequential = fewer rate limit headaches)
     const debug = [];
     const allItems = [];
 
@@ -89,11 +84,10 @@ export default async function handler(req, res) {
         allItems.push(...result.items);
       }
 
-      // Basic stop condition to avoid hammering the API in development
-      if (allItems.length >= 60) break;
+      if (allItems.length >= 80) break;
     }
 
-    // Dedupe by volume ID
+    // --- Clean + dedupe ---
     const seen = new Set();
     const candidates = [];
 
@@ -102,13 +96,26 @@ export default async function handler(req, res) {
       seen.add(item.id);
 
       const info = item.volumeInfo || {};
+      const title = info.title || "";
+      const authors = info.authors || [];
+      const publishedDate = info.publishedDate || "";
+      const description = info.description || "";
+      const categories = info.categories || [];
+
+      // Basic quality filters (keep classics; just avoid junk)
+      if (!title) continue;
+      if (!authors.length) continue;
+
+      // Remove entries with no description (AI has nothing to judge vibe on)
+      if (!description || description.length < 40) continue;
+
       candidates.push({
         id: item.id,
-        title: info.title || "",
-        authors: info.authors || [],
-        publishedDate: info.publishedDate || "",
-        description: info.description || "",
-        categories: info.categories || [],
+        title,
+        authors,
+        publishedDate,
+        description,
+        categories,
         thumbnail:
           (info.imageLinks && (info.imageLinks.thumbnail || info.imageLinks.smallThumbnail)) || "",
         infoLink: info.infoLink || "",
@@ -116,18 +123,15 @@ export default async function handler(req, res) {
     }
 
     return res.status(200).json({
+      seed,
+      genre,
+      mood, // we keep mood for the AI layer, but we DO NOT use it in Google searching
       queriesUsed: uniqueTerms,
       count: candidates.length,
       candidates,
       debug: debug.map((d) => {
-        // Keep debug useful but safe
         if (d.ok) {
-          return {
-            term: d.term,
-            ok: true,
-            count: d.count,
-            url: d.urlWithoutKey,
-          };
+          return { term: d.term, ok: true, count: d.count, url: d.urlWithoutKey };
         }
         return {
           term: d.term,
